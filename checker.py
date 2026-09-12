@@ -187,17 +187,22 @@ async def check_fragment_listed(username: str) -> bool:
     True kalau username ini beneran "milik" Fragment (lagi dilelang, dijual
     harga tetap, atau sudah kejual/resale lewat Fragment).
 
-    False kalau:
-    - halaman tidak mengembalikan baris hasil untuk username ini sama sekali, ATAU
-    - baris hasilnya cuma menunjukkan status "Unavailable" generik.
+    SINYAL YANG DIPAKAI (terbukti dari perbandingan nyata):
+    - Kalau fragment.com PUNYA halaman detail khusus untuk username ini,
+      request ke /username/<username> TETAP di URL itu (tidak di-redirect).
+      Ini kejadian nyata pada @lsanghyeon (listing aktif) -> final_url tetap
+      "https://fragment.com/username/lsanghyeon", dengan og:title
+      "Buy @lsanghyeon" / "lsanghyeon – Fragment".
+    - Kalau fragment.com TIDAK punya listing untuk username ini, request
+      di-redirect ke halaman pencarian "https://fragment.com/?query=<username>".
+      Ini kejadian nyata pada @weonho dan @fikayr (keduanya bukan listing,
+      salah satunya malah banned) -- keduanya sama-sama di-redirect ke
+      halaman pencarian, meski tabel hasilnya sempat menampilkan status
+      "Unavailable" generik (yang TERBUKTI tidak berarti apa-apa soal
+      username itu sendiri, lihat catatan di check_username_full).
 
-    PENTING: "Unavailable" di Fragment TERBUKTI muncul untuk username biasa
-    yang belum di-review sepenuhnya (banyak literally tampil begini, termasuk
-    yang sudah dipastikan available maupun yang banned) -- itu representasi
-    dari pembatasan rilis Fragment per rentang huruf, BUKAN sinyal soal
-    status username itu sendiri. Jadi status ini SENGAJA dianggap False di
-    sini, supaya keputusan available/banned tetap sepenuhnya ditentukan oleh
-    hasil resolveUsername (MTProto), bukan oleh Fragment.
+    Jadi: redirect ke ?query= -> bukan listing. Tetap di /username/<nama>
+    -> listing beneran.
     """
     url = f"https://fragment.com/username/{username}"
     async with _FRAGMENT_SEM:
@@ -207,39 +212,23 @@ async def check_fragment_listed(username: str) -> bool:
         except Exception:
             return False
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    final_url = str(resp.url)
 
-    target = f"@{username}".lower()
-    row = None
-    for tr in soup.select("tr[data-username]"):
-        if tr.get("data-username", "").lower() == target:
-            row = tr
-            break
-
-    if row is None:
+    # Di-redirect ke halaman pencarian -> bukan listing.
+    if "?query=" in final_url or "/query=" in final_url:
         return False
 
-    status_cell = row.select_one(".wide-last-col .tm-value")
-    status_text = status_cell.get_text(strip=True).lower() if status_cell else ""
-
-    if status_text in ("", "unavailable"):
-        return False
-
-    # Status lain yang ketemu di kolom ini kemungkinan besar: "for sale",
-    # "on auction", "sold", atau harga (mis. angka + simbol TON) -- semuanya
-    # berarti username ini beneran nyangkut di Fragment.
+    # Tetap di halaman detail /username/<nama> -> Fragment mengenali ini
+    # sebagai item tersendiri (listing). og:title cuma dipakai buat log/
+    # kepastian tambahan, bukan syarat mutlak.
     return True
 
 
 async def debug_fragment_row(username: str) -> str:
-    """Util kecil buat kalibrasi manual: kembalikan potongan HTML baris tabel
-    fragment.com untuk username ini (kalau ketemu), plus status_text yang
-    dibaca. Dipakai lewat command bot kalau suatu saat perlu debug lagi.
-
-    Sekarang juga kasih info diagnostik dasar (status_code, title, jumlah
-    baris <tr data-username> yang ketemu di HALAMAN, panjang HTML) supaya
-    kita bisa bedain "beneran gak ada listing" vs "fragment.com lagi nge-block
-    request kita (Cloudflare challenge / rate limit)"."""
+    """Util kecil buat kalibrasi manual: kembalikan status_code, final_url,
+    title halaman, dan kesimpulan is_listed berdasarkan logika terbaru
+    (redirect ke ?query= -> bukan listing, tetap di /username/<nama> ->
+    listing). Dipakai lewat command bot kalau suatu saat perlu debug lagi."""
     url = f"https://fragment.com/username/{username}"
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, headers=HEADERS, timeout=15, follow_redirects=True)
@@ -248,30 +237,19 @@ async def debug_fragment_row(username: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     title_tag = soup.find("title")
     title = title_tag.get_text(strip=True) if title_tag else "(tidak ada)"
+    final_url = str(resp.url)
 
-    all_rows = soup.select("tr[data-username]")
+    is_listed = "?query=" not in final_url and "/query=" not in final_url
 
     diag = (
         f"status_code = {resp.status_code}\n"
-        f"final_url = {resp.url}\n"
+        f"final_url = {final_url}\n"
         f"title halaman = {title!r}\n"
         f"panjang HTML = {len(html)} karakter\n"
-        f"jumlah <tr data-username> ketemu di halaman = {len(all_rows)}\n"
+        f"kesimpulan is_listed (logika baru) = {is_listed}\n"
     )
 
     if "cloudflare" in html.lower() or "captcha" in html.lower() or "checking your browser" in html.lower():
         diag += "\n⚠️ HTML mengandung indikasi Cloudflare/captcha challenge -- kemungkinan request kita lagi diblokir sementara.\n"
 
-    target = f"@{username}".lower()
-    row = None
-    for tr in all_rows:
-        if tr.get("data-username", "").lower() == target:
-            row = tr
-            break
-
-    if row is None:
-        return diag + f"\nTidak ketemu baris untuk @{username} secara spesifik."
-
-    status_cell = row.select_one(".wide-last-col .tm-value")
-    status_text = status_cell.get_text(strip=True) if status_cell else "(tidak ada)"
-    return diag + f"\nstatus_text = {status_text!r}\n\nHTML baris:\n{str(row)[:1200]}"
+    return diag
