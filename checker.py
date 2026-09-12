@@ -234,22 +234,44 @@ async def check_fragment_listed(username: str) -> bool:
 async def debug_fragment_row(username: str) -> str:
     """Util kecil buat kalibrasi manual: kembalikan potongan HTML baris tabel
     fragment.com untuk username ini (kalau ketemu), plus status_text yang
-    dibaca. Dipakai lewat command bot kalau suatu saat perlu debug lagi."""
+    dibaca. Dipakai lewat command bot kalau suatu saat perlu debug lagi.
+
+    Sekarang juga kasih info diagnostik dasar (status_code, title, jumlah
+    baris <tr data-username> yang ketemu di HALAMAN, panjang HTML) supaya
+    kita bisa bedain "beneran gak ada listing" vs "fragment.com lagi nge-block
+    request kita (Cloudflare challenge / rate limit)"."""
     url = f"https://fragment.com/username/{username}"
     async with httpx.AsyncClient() as client:
         resp = await client.get(url, headers=HEADERS, timeout=15, follow_redirects=True)
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html = resp.text
+    soup = BeautifulSoup(html, "html.parser")
+    title_tag = soup.find("title")
+    title = title_tag.get_text(strip=True) if title_tag else "(tidak ada)"
+
+    all_rows = soup.select("tr[data-username]")
+
+    diag = (
+        f"status_code = {resp.status_code}\n"
+        f"final_url = {resp.url}\n"
+        f"title halaman = {title!r}\n"
+        f"panjang HTML = {len(html)} karakter\n"
+        f"jumlah <tr data-username> ketemu di halaman = {len(all_rows)}\n"
+    )
+
+    if "cloudflare" in html.lower() or "captcha" in html.lower() or "checking your browser" in html.lower():
+        diag += "\n⚠️ HTML mengandung indikasi Cloudflare/captcha challenge -- kemungkinan request kita lagi diblokir sementara.\n"
+
     target = f"@{username}".lower()
     row = None
-    for tr in soup.select("tr[data-username]"):
+    for tr in all_rows:
         if tr.get("data-username", "").lower() == target:
             row = tr
             break
 
     if row is None:
-        return f"Tidak ketemu baris untuk @{username} di fragment.com."
+        return diag + f"\nTidak ketemu baris untuk @{username} secara spesifik."
 
     status_cell = row.select_one(".wide-last-col .tm-value")
     status_text = status_cell.get_text(strip=True) if status_cell else "(tidak ada)"
-    return f"status_text = {status_text!r}\n\nHTML baris:\n{str(row)[:1500]}"
+    return diag + f"\nstatus_text = {status_text!r}\n\nHTML baris:\n{str(row)[:1200]}"
