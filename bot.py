@@ -123,7 +123,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @_owner_only
 async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Buat kalibrasi: lihat beberapa sinyal mentah dari t.me + fragment.com"""
+    """Buat kalibrasi: lihat data mentah lengkap dari t.me + fragment.com"""
     if not context.args:
         await update.message.reply_text("Contoh: /raw username1")
         return
@@ -133,27 +133,57 @@ async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg = await checker.check_telegram(client, username)
         fg = await checker.check_fragment(client, username)
 
-    if "error" in dump:
-        await update.message.reply_text(f"[t.me] error: {dump['error']}")
+    tme = dump.get("tme", {})
+    if "error" in tme:
+        await update.message.reply_text(f"[t.me] error: {tme['error']}")
     else:
         await update.message.reply_text(
             "[t.me]\n"
-            f"status_code = {dump['status_code']}\n"
-            f"title = {dump['title']!r}\n"
-            f"og_description = {dump['og_description']!r}\n"
-            f"has_page_photo = {dump['has_page_photo']}\n"
-            f"has_action_button = {dump['has_action_button']}\n\n"
-            f"body_preview:\n{dump['body_preview']}\n\n"
-            f"--- KESIMPULAN ---\n"
+            f"status_code = {tme['status_code']}\n"
+            f"title = {tme['title']!r}\n"
+            f"og_description = {tme['og_description']!r}\n"
+            f"has_page_photo = {tme['has_page_photo']}\n"
+            f"has_action_button = {tme['has_action_button']}\n\n"
+            f"body_preview:\n{tme['body_preview']}\n\n"
+            f"--- KESIMPULAN t.me ---\n"
             f"state = {tg['state']}\n"
             f"nama di kalimat 'right away' = {tg.get('mentioned_name')!r}"
         )
-    await update.message.reply_text(f"[fragment] state={fg['state']}\nog:title = {fg.get('og_title', '(kosong)')!r}")
+
+    frag = dump.get("fragment", {})
+    if "error" in frag:
+        await update.message.reply_text(f"[fragment full page] error: {frag['error']}")
+    else:
+        await update.message.reply_text(
+            "[fragment.com full page]\n"
+            f"status_code = {frag['status_code']}\n"
+            f"final_url = {frag['final_url']}\n"
+            f"title = {frag['title']!r}\n"
+            f"og_title = {frag['og_title']!r}\n"
+            f"og_description = {frag['og_description']!r}\n\n"
+            f"body_preview:\n{frag['body_preview']}\n\n"
+            f"--- KESIMPULAN fragment ---\n"
+            f"state = {fg['state']}"
+        )
+
+
+ACTIONABLE_STATES = {"AVAILABLE", "FRAGMENT"}
+
+ACTION_LINE = {
+    "AVAILABLE": lambda u: f"@{u} avail di-keep! 🟢",
+    "FRAGMENT": lambda u: f"@{u} fragment! silahkan hapus dari list 🔷",
+}
 
 
 async def background_checker(app: Application):
     """Loop tanpa henti: muter round-robin ke semua username di watchlist,
-    dengan jeda CHECK_DELAY_SECONDS antar-cek supaya tidak kena rate limit."""
+    dengan jeda CHECK_DELAY_SECONDS antar-cek supaya tidak kena rate limit.
+
+    Setelah SATU PUTARAN PENUH selesai, kirim SATU pesan ringkasan berisi
+    semua username yang statusnya AVAILABLE atau FRAGMENT -- tapi cuma yang
+    BARU actionable (baru jadi available/fragment, atau baru pertama kali
+    dicek dan langsung actionable). Kalau statusnya sudah pernah dikabarkan
+    dan belum berubah, tidak diulang lagi supaya tidak spam."""
     await app.bot.send_message(OWNER_CHAT_ID, "✅ Background checker mulai jalan.")
     async with httpx.AsyncClient() as client:
         while True:
@@ -162,25 +192,36 @@ async def background_checker(app: Application):
                 await asyncio.sleep(10)
                 continue
 
+            to_report = []  # list of (username, state) yang perlu dikabarkan putaran ini
+
             for username in list(wl.keys()):
                 try:
                     result = await checker.check_username_full(client, username)
                     new_state = result["final"]
-                    old_state = wl.get(username, {}).get("last_state")
                     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
                     storage.update_state(username, new_state, now_str)
 
-                    if old_state is not None and old_state != new_state:
-                        label = STATE_LABEL.get(new_state, new_state)
-                        await app.bot.send_message(
-                            OWNER_CHAT_ID,
-                            f"🔔 Status berubah!\n@{username}\n{old_state} -> {label}",
-                        )
+                    last_notified = wl.get(username, {}).get("last_notified")
+
+                    if new_state in ACTIONABLE_STATES:
+                        if last_notified != new_state:
+                            to_report.append((username, new_state))
+                            storage.update_notified(username, new_state)
+                    else:
+                        # status sudah tidak actionable lagi -> reset, supaya kalau
+                        # nanti balik lagi jadi available/fragment, dikabarkan ulang
+                        if last_notified is not None:
+                            storage.update_notified(username, None)
+
                 except Exception as e:
                     logger.exception(f"Gagal cek {username}: {e}")
 
                 await asyncio.sleep(CHECK_DELAY_SECONDS)
+
+            if to_report:
+                lines = [ACTION_LINE[state](u) for u, state in to_report]
+                await app.bot.send_message(OWNER_CHAT_ID, "\n".join(lines))
 
 
 async def _post_init(app: Application):
