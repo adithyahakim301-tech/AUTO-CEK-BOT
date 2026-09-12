@@ -101,7 +101,33 @@ async def check_fragment(client: httpx.AsyncClient, username: str) -> dict:
     return {"state": "unknown", "og_title": og_title, "raw": resp.text[:800]}
 
 
-async def check_username_full(client: httpx.AsyncClient, username: str) -> dict:
+async def debug_dump(client: httpx.AsyncClient, username: str) -> dict:
+    """Dump beberapa sinyal dari t.me untuk kalibrasi manual (bukan dipakai di logika utama)."""
+    url = f"https://t.me/{username}"
+    try:
+        resp = await client.get(url, headers=HEADERS, timeout=15, follow_redirects=True)
+    except Exception as e:
+        return {"error": str(e)}
+
+    html = resp.text
+    soup = BeautifulSoup(html, "html.parser")
+
+    title_tag = soup.find("title")
+    og_desc_tag = soup.find("meta", property="og:description")
+    og_image_tag = soup.find("meta", property="og:image")
+    has_page_photo = soup.select_one(".tgme_page_photo") is not None
+    has_action_button = soup.select_one(".tgme_action_button_new") is not None
+    body_text = soup.get_text(" ", strip=True)
+
+    return {
+        "status_code": resp.status_code,
+        "title": title_tag.get_text(strip=True) if title_tag else "(tidak ada)",
+        "og_description": (og_desc_tag.get("content") if og_desc_tag else "(tidak ada)"),
+        "og_image": (og_image_tag.get("content") if og_image_tag else "(tidak ada)"),
+        "has_page_photo": has_page_photo,
+        "has_action_button": has_action_button,
+        "body_preview": body_text[:500],
+    }
     """
     Gabungkan hasil t.me + fragment.com jadi satu status final. Fragment dicek
     DULU karena kalau sudah kelihatan for_sale/owned di Fragment, itu paling
