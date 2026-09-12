@@ -7,6 +7,10 @@ Fitur:
 - /list                  -> lihat watchlist + status terakhir
 - /check username        -> cek langsung satu username
 - /raw username          -> lihat potongan HTML mentah (buat kalibrasi deteksi)
+- /rawfull username      -> kirim HTML MENTAH LENGKAP (t.me + fragment) sebagai
+                             file .html, dipakai kalau /raw kurang untuk cari
+                             marker banned yang sebenarnya (karena preview di
+                             /raw dipotong 500/700 karakter)
 - Background loop        -> jalan terus, muter round-robin ke semua username
                              di watchlist dengan jeda antar-cek supaya aman
                              dari rate limit, dan kirim notifikasi ke Anda
@@ -18,6 +22,7 @@ cuma dipakai untuk kirim/terima pesan command dengan Anda.
 """
 
 import asyncio
+import io
 import logging
 import os
 from datetime import datetime, timezone
@@ -64,7 +69,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/remove username - hapus username\n"
         "/list - lihat watchlist\n"
         "/check username - cek langsung\n"
-        "/raw username - lihat HTML mentah (debug)"
+        "/raw username - lihat potongan HTML mentah (debug)\n"
+        "/rawfull username - kirim HTML lengkap sebagai file (debug lanjutan)"
     )
 
 
@@ -123,7 +129,9 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @_owner_only
 async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Buat kalibrasi: lihat data mentah lengkap dari t.me + fragment.com"""
+    """Buat kalibrasi: lihat data mentah dari t.me + fragment.com (dipotong
+    500/700 karakter biar muat di satu pesan chat). Kalau ini kurang buat
+    nemuin marker yang dicari, pakai /rawfull untuk HTML lengkap."""
     if not context.args:
         await update.message.reply_text("Contoh: /raw username1")
         return
@@ -167,11 +175,35 @@ async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-ACTIONABLE_STATES = {"AVAILABLE", "FRAGMENT"}
+@_owner_only
+async def cmd_rawfull(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kirim HTML mentah LENGKAP (t.me + fragment) sebagai file .html,
+    tanpa dipotong sama sekali. Dipakai kalau /raw kurang untuk mencari
+    marker banned/status yang sebenarnya (misal username yang harusnya
+    banned tapi kebaca available/unknown oleh checker)."""
+    if not context.args:
+        await update.message.reply_text("Contoh: /rawfull username1")
+        return
+    username = context.args[0].lstrip("@")
+    await update.message.reply_text(f"Mengambil HTML lengkap untuk @{username} ...")
+    async with httpx.AsyncClient() as client:
+        dump = await checker.fetch_raw_html(client, username)
+
+    tme_bytes = io.BytesIO(dump["tme_html"].encode("utf-8"))
+    tme_bytes.name = f"tme_{username}.html"
+    await update.message.reply_document(tme_bytes)
+
+    fg_bytes = io.BytesIO(dump["fragment_html"].encode("utf-8"))
+    fg_bytes.name = f"fragment_{username}.html"
+    await update.message.reply_document(fg_bytes)
+
+
+ACTIONABLE_STATES = {"AVAILABLE", "FRAGMENT", "BANNED"}
 
 ACTION_LINE = {
     "AVAILABLE": lambda u: f"@{u} avail di-keep! 🟢",
     "FRAGMENT": lambda u: f"@{u} fragment! silahkan hapus dari list 🔷",
+    "BANNED": lambda u: f"@{u} terbanned! hapus dari list 🔴",
 }
 
 
@@ -180,8 +212,8 @@ async def background_checker(app: Application):
     dengan jeda CHECK_DELAY_SECONDS antar-cek supaya tidak kena rate limit.
 
     Setelah SATU PUTARAN PENUH selesai, kirim SATU pesan ringkasan berisi
-    semua username yang statusnya AVAILABLE atau FRAGMENT -- tapi cuma yang
-    BARU actionable (baru jadi available/fragment, atau baru pertama kali
+    semua username yang statusnya AVAILABLE, FRAGMENT, atau BANNED -- tapi
+    cuma yang BARU actionable (baru berubah status, atau baru pertama kali
     dicek dan langsung actionable). Kalau statusnya sudah pernah dikabarkan
     dan belum berubah, tidak diulang lagi supaya tidak spam."""
     await app.bot.send_message(OWNER_CHAT_ID, "✅ Background checker mulai jalan.")
@@ -210,7 +242,7 @@ async def background_checker(app: Application):
                             storage.update_notified(username, new_state)
                     else:
                         # status sudah tidak actionable lagi -> reset, supaya kalau
-                        # nanti balik lagi jadi available/fragment, dikabarkan ulang
+                        # nanti balik lagi jadi available/fragment/banned, dikabarkan ulang
                         if last_notified is not None:
                             storage.update_notified(username, None)
 
@@ -238,6 +270,7 @@ def main():
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("raw", cmd_raw))
+    app.add_handler(CommandHandler("rawfull", cmd_rawfull))
 
     logger.info("Bot starting...")
     app.run_polling()
