@@ -3,7 +3,7 @@ Bot pemantau username Telegram.
 
 Fitur:
 - /add user1 user2 ...   -> tambah username ke watchlist
-- /remove username       -> hapus dari watchlist
+- /hapus username        -> hapus 1 username dari watchlist
 - /list                  -> lihat watchlist + status terakhir
 - /check username        -> cek langsung satu username
 - Background loop        -> jalan terus, muter round-robin ke semua username
@@ -27,7 +27,7 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telethon import TelegramClient
 
@@ -48,12 +48,12 @@ API_HASH = os.environ["API_HASH"]        # dari my.telegram.org
 CHECK_DELAY_SECONDS = float(os.getenv("CHECK_DELAY_SECONDS", "1"))
 
 STATE_LABEL = {
-    "AVAILABLE": "🟢 AVAILABLE (bisa di-keep)",
-    "TAKEN": "🟡 TAKEN (sedang dipakai orang)",
-    "FRAGMENT": "🔷 FRAGMENT (di-auction/dijual di Fragment)",
-    "BANNED": "🔴 BANNED",
-    "INVALID": "⚫ INVALID (format username salah)",
-    "ERROR": "⚪ ERROR (gagal dicek, coba lagi nanti)",
+    "AVAILABLE": "🟢 Available",
+    "TAKEN": "🟡 Taken",
+    "FRAGMENT": "🌀 Fragment",
+    "BANNED": "🔴 Banned",
+    "INVALID": "⚫ Invalid",
+    "ERROR": "⚪ Error",
 }
 
 # Status dari checker.Status (huruf kecil) -> key yang dipakai di STATE_LABEL
@@ -83,7 +83,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Bot pemantau username aktif.\n\n"
         "/add user1 user2 ... - tambah username\n"
-        "/remove username - hapus username\n"
+        "/hapus username - hapus username\n"
         "/list - lihat watchlist\n"
         "/check username - cek langsung"
     )
@@ -104,7 +104,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @_owner_only
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Contoh: /remove username1")
+        await update.message.reply_text("Contoh: /hapus username1")
         return
     ok = storage.remove_username(context.args[0])
     await update.message.reply_text("Dihapus." if ok else "Username tidak ditemukan di watchlist.")
@@ -118,10 +118,9 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = []
     for uname, info in wl.items():
-        state = info.get("last_state") or "belum dicek"
-        label = STATE_LABEL.get(state, state)
-        checked = info.get("last_checked") or "-"
-        lines.append(f"@{uname} -> {label} (terakhir: {checked})")
+        state = info.get("last_state")
+        label = STATE_LABEL.get(state, "belum dicek")
+        lines.append(f"@{uname} {label}")
     text = "\n".join(lines)
     for i in range(0, len(text), 3500):
         await update.message.reply_text(text[i:i + 3500])
@@ -136,9 +135,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Mengecek @{username} ...")
     raw_status = await pool.check(username)
     final = STATUS_TO_FINAL.get(raw_status, "ERROR")
-    await update.message.reply_text(
-        f"@{username} -> {STATE_LABEL.get(final, final)}"
-    )
+    await update.message.reply_text(f"@{username} {STATE_LABEL.get(final, final)}")
 
 
 @_owner_only
@@ -158,9 +155,9 @@ async def cmd_fragdebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ACTIONABLE_STATES = {"AVAILABLE", "FRAGMENT", "BANNED"}
 
 ACTION_LINE = {
-    "AVAILABLE": lambda u: f"@{u} avail di-keep! 🟢",
-    "FRAGMENT": lambda u: f"@{u} fragment! silahkan hapus dari list 🔷",
-    "BANNED": lambda u: f"@{u} terbanned! hapus dari list 🔴",
+    "AVAILABLE": lambda u: f"@{u} 🟢 Available",
+    "FRAGMENT": lambda u: f"@{u} 🌀 Fragment",
+    "BANNED": lambda u: f"@{u} 🔴 Banned",
 }
 
 
@@ -223,6 +220,15 @@ async def _post_init(app: Application):
     pool = UsernamePool([worker], min_delay=1.3)
     logger.info("UsernamePool siap (1 worker).")
 
+    # Daftarkan menu command supaya muncul saat user ketik "/" di chat.
+    await app.bot.set_my_commands([
+        BotCommand("start", "Mulai / lihat daftar command"),
+        BotCommand("add", "Tambah username ke watchlist"),
+        BotCommand("hapus", "Hapus username dari watchlist"),
+        BotCommand("list", "Lihat semua username di watchlist"),
+        BotCommand("check", "Cek status satu username langsung"),
+    ])
+
     # Jalankan background loop sebagai task terpisah, tidak blocking bot command
     asyncio.create_task(background_checker(app))
 
@@ -232,7 +238,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CommandHandler(["hapus", "remove"], cmd_remove))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("fragdebug", cmd_fragdebug))
