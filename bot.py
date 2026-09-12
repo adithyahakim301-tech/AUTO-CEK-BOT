@@ -44,7 +44,7 @@ STATE_LABEL = {
     "TAKEN": "🟡 TAKEN (sedang dipakai orang)",
     "FRAGMENT": "🔷 FRAGMENT (di-auction/dijual di Fragment)",
     "BANNED": "🔴 BANNED",
-    "UNKNOWN": "⚪ UNKNOWN (gagal cek)",
+    "UNKNOWN": "⚪ UNKNOWN (perlu cek manual, hasil ambigu)",
 }
 
 
@@ -131,8 +131,12 @@ async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with httpx.AsyncClient() as client:
         tg = await checker.check_telegram(client, username)
         fg = await checker.check_fragment(client, username)
-    await update.message.reply_text(f"[t.me] state={tg['state']}\n{tg.get('raw', '')[:1500]}")
-    await update.message.reply_text(f"[fragment] state={fg['state']}\n{fg.get('raw', '')[:1500]}")
+    await update.message.reply_text(
+        f"[t.me] state={tg['state']}\nog:title = {tg.get('og_title', '(kosong)')!r}"
+    )
+    await update.message.reply_text(
+        f"[fragment] state={fg['state']}\nog:title = {fg.get('og_title', '(kosong)')!r}"
+    )
 
 
 async def background_checker(app: Application):
