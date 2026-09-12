@@ -141,6 +141,20 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@_owner_only
+async def cmd_fragdebug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Debug sementara: lihat status_text + potongan HTML mentah yang dibaca
+    check_fragment_listed untuk satu username. Dipakai buat kalibrasi ulang
+    kalau ada username yang seharusnya FRAGMENT tapi kebaca AVAILABLE/TAKEN."""
+    if not context.args:
+        await update.message.reply_text("Contoh: /fragdebug username1")
+        return
+    username = context.args[0].lstrip("@")
+    result = await checker.debug_fragment_row(username)
+    for i in range(0, len(result), 3500):
+        await update.message.reply_text(result[i:i + 3500])
+
+
 ACTIONABLE_STATES = {"AVAILABLE", "FRAGMENT", "BANNED"}
 
 ACTION_LINE = {
@@ -221,6 +235,7 @@ def main():
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("fragdebug", cmd_fragdebug))
 
     logger.info("Bot starting...")
     app.run_polling()
