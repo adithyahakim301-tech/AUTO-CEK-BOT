@@ -49,6 +49,7 @@ def add_usernames(usernames: list[str]) -> list[str]:
                 data["usernames"][u] = {
                     "last_state": None,
                     "last_checked": None,
+                    "last_notified": None,
                 }
                 added.append(u)
         _save(data)
@@ -77,4 +78,14 @@ def update_state(username: str, state: str, checked_at: str) -> None:
         if username in data["usernames"]:
             data["usernames"][username]["last_state"] = state
             data["usernames"][username]["last_checked"] = checked_at
+            _save(data)
+
+
+def update_notified(username: str, notified_state) -> None:
+    """Catat status apa yang TERAKHIR sudah dikabarkan ke owner untuk username ini.
+    notified_state=None berarti 'belum pernah / sudah tidak actionable lagi'."""
+    with _lock:
+        data = _load()
+        if username in data["usernames"]:
+            data["usernames"][username]["last_notified"] = notified_state
             _save(data)
