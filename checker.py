@@ -1,31 +1,71 @@
 """
-Modul pengecekan status username -- TANPA butuh akun Telegram sama sekali.
+checker.py
+Modul pengecekan status username Telegram -- pakai MTProto (Telethon) untuk
+status inti (available/taken/banned) dan scraping fragment.com untuk deteksi
+listing/lelang.
 
-Dua sumber yang dicek:
-1. https://t.me/<username>  -> halaman preview publik Telegram
-   Dipakai untuk menentukan: available / taken / banned
-2. https://fragment.com/username/<username> -> marketplace Fragment
-   Dipakai untuk menentukan apakah username sedang di-auction/dijual di Fragment
+Status yang dikembalikan (lihat class Status):
+- AVAILABLE : username kosong, bisa langsung diklaim
+- FRAGMENT  : username terdaftar/dilelang/dijual di fragment.com
+- TAKEN     : username sudah dipakai orang lain
+- BANNED    : Telegram menandai entity ini `restricted` (kena TOS violation),
+              ATAU resolveUsername melempar UsernameInvalidError padahal
+              formatnya valid -- keduanya sinyal RESMI dari Telegram, bukan
+              tebakan dari teks halaman publik
+- INVALID   : format username tidak valid (terlalu pendek / karakter aneh)
+- ERROR     : gagal dicek (network/API error)
 
-PENTING -- soal akurasi:
-Deteksi di bawah ini berbasis pola HTML/teks yang umum ditemukan di kedua
-halaman tersebut. Karena Telegram & Fragment bisa mengubah markup halaman
-sewaktu-waktu, ada kemungkinan deteksi meleset untuk kasus tertentu.
+KENAPA TIDAK LAGI SCRAPING t.me:
+Sudah dibuktikan lewat perbandingan HTML mentah: halaman publik t.me
+menampilkan markup YANG SAMA PERSIS untuk username yang benar-benar belum
+pernah dipakai (truly available) MAUPUN yang sudah kena banned Telegram --
+keduanya fallback ke "If you have Telegram, you can contact X right away"
+generik. Jadi t.me TIDAK BISA dipakai untuk membedakan available vs banned,
+titik. Sinyal yang valid hanya ada di MTProto API.
 
-Gunakan command /raw <username> di bot untuk melihat potongan HTML mentah
-(preview terpotong) atau /rawfull <username> untuk mengambil HTML LENGKAP
-sebagai file .html -- ini penting kalau ada status yang salah baca, karena
-marker yang dicari mungkin ada di luar batas potongan preview.
+CATATAN soal method API:
+`account.checkUsername` cuma boleh dipanggil oleh akun user asli -- kalau
+dipanggil pakai bot token, Telegram selalu melempar BotMethodInvalidError.
+Makanya dipakai `contacts.resolveUsername`, yang BOLEH dipanggil bot, dengan
+alur:
 
-Sebelum dipakai produksi, coba dulu ke beberapa username yang statusnya
-sudah Anda ketahui pasti (satu yang jelas available, satu yang jelas taken,
-satu yang jelas banned) untuk kalibrasi.
+1. resolveUsername berhasil (ada entity) ->
+   - kalau entity.restricted == True -> BANNED
+   - kalau tidak -> occupied (lanjut cek Fragment untuk mastiin bukan listing)
+2. resolveUsername -> UsernameNotOccupiedError -> bebas dari sisi Telegram,
+   tapi tetap dicek ke fragment.com dulu:
+     - ketemu listing/lelang aktif -> FRAGMENT
+     - tidak ketemu -> AVAILABLE
+3. resolveUsername -> UsernameInvalidError padahal format lolos regex ->
+   heuristik BANNED (jarang, tapi ini juga sinyal resmi dari Telegram)
+
+Fragment.com TIDAK dipakai buat nentuin available/banned -- cuma buat deteksi
+"apakah harus dibeli lewat Fragment" (baik saat masih kosong maupun saat
+sedang dipakai orang). Status "Unavailable" generik di Fragment (yang
+muncul untuk hampir semua username biasa karena Telegram baru buka lelang
+untuk rentang huruf tertentu) TIDAK dihitung sebagai listing -- itu bukan
+sinyal soal username-nya, itu cuma pembatasan platform Fragment.
+
+Strategi anti-flood: banyak worker (bot token) round-robin, delay + jitter
+tiap request, dan auto-cooldown per-worker kalau kena FloodWaitError.
 """
 
+import asyncio
+import random
 import re
+import time
+from dataclasses import dataclass, field
+from typing import Optional
 
 import httpx
 from bs4 import BeautifulSoup
+from telethon import TelegramClient
+from telethon.errors import FloodWaitError, UsernameInvalidError, UsernameNotOccupiedError
+from telethon.tl.functions.contacts import ResolveUsernameRequest
+
+# Aturan format username Telegram: 5-32 karakter, huruf/angka/underscore,
+# tidak boleh diawali angka.
+USERNAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{4,31}$")
 
 HEADERS = {
     "User-Agent": (
@@ -35,234 +75,181 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-BANNED_MARKERS = [
-    "this account has been banned",
-    "this channel can't be displayed",
-    "violates telegram's terms of service",
-    "account was permanently banned",
-    "spread pornographic content",
-    "spread violent content",
-]
 
-# Pola: "If you have Telegram, you can [contact|view and join|launch|join] X right away."
-# Kalau X == username itu sendiri -> generic fallback -> username TIDAK terdaftar.
-# Kalau X == nama lain (nama tampilan asli akun) -> username SUDAH dipakai.
-# PENTING: harus dijangkar ke "If you have Telegram, you can..." -- kalau cuma
-# cari kata "contact" saja, dia kepancing sama judul halaman "Telegram: Contact
-# @username" yang SELALU ada di awal body, sebelum kalimat yang sebenarnya.
-RIGHT_AWAY_RE = re.compile(
-    r"if you have telegram\s*,?\s*you can\s+(?:contact|view and join|launch|join)\s+(.+?)\s+right away",
-    re.IGNORECASE,
-)
+class Status:
+    AVAILABLE = "available"
+    FRAGMENT = "fragment"
+    TAKEN = "taken"
+    BANNED = "banned"
+    INVALID = "invalid"
+    ERROR = "error"
 
 
-def _get_og_title(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    tag = soup.find("meta", property="og:title")
-    return (tag.get("content") or "").strip() if tag else ""
+# Batasi request bersamaan ke fragment.com biar ga keblokir Cloudflare-nya.
+_FRAGMENT_SEM = asyncio.Semaphore(5)
 
 
-async def check_telegram(client: httpx.AsyncClient, username: str) -> dict:
-    """Return {'state': 'available'|'taken'|'banned'|'unknown', 'raw': str}
+@dataclass
+class Worker:
+    """Satu sesi Telethon (login via bot token)."""
 
-    Catatan kalibrasi (dari data nyata): og:title SELALU berformat generik
-    "Telegram: Contact @username" baik untuk username yang ada maupun yang
-    tidak -- jadi og:title TIDAK dipakai untuk penentuan status. Sinyal asli
-    ada di body: kalimat "...you can contact X right away" memakai username
-    itu sendiri sebagai fallback kalau akun tidak ada, tapi memakai nama
-    tampilan asli akun kalau akun ADA. Dikuatkan dengan cek foto profil &
-    og:description (keduanya kosong/tidak ada kalau username belum dipakai).
+    client: TelegramClient
+    name: str
+    cooldown_until: float = 0.0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    CATATAN PENTING soal BANNED: sejauh ini terbukti username yang di-banned
-    BISA menghasilkan pola body yang SAMA PERSIS dengan username yang benar-
-    benar available (generic fallback "you can contact X right away" dengan
-    X == username itu sendiri, tanpa foto, tanpa og:description). Artinya
-    BANNED_MARKERS di atas belum tentu lengkap/akurat untuk semua kasus --
-    Telegram bisa memakai frasa lain untuk halaman banned yang belum masuk
-    daftar. Kalau ketemu username yang harusnya banned tapi kebaca available,
-    gunakan /rawfull untuk ambil HTML utuh, cari frasa pembeda yang sebenarnya,
-    lalu tambahkan ke BANNED_MARKERS.
+    def is_ready(self) -> bool:
+        return time.time() >= self.cooldown_until
+
+
+class UsernamePool:
+    """Kumpulan worker supaya beban & flood-wait terbagi rata.
+    Dengan 1 worker (1 bot token) tetap jalan normal, cuma round-robin-nya
+    trivial (selalu balik ke worker yang sama)."""
+
+    def __init__(self, workers: list[Worker], min_delay: float = 1.3):
+        if not workers:
+            raise ValueError("Butuh minimal 1 worker/bot token.")
+        self.workers = workers
+        self.min_delay = min_delay
+        self._rr = 0  # index round-robin
+
+    async def start(self):
+        await asyncio.gather(*(w.client.connect() for w in self.workers))
+
+    def _pick_worker(self) -> Optional[Worker]:
+        n = len(self.workers)
+        for i in range(n):
+            idx = (self._rr + i) % n
+            w = self.workers[idx]
+            if w.is_ready():
+                self._rr = (idx + 1) % n
+                return w
+        return None
+
+    async def check(self, username: str, _depth: int = 0) -> str:
+        username = username.lstrip("@").strip()
+
+        if not USERNAME_RE.match(username):
+            return Status.INVALID
+
+        if _depth > len(self.workers) + 2:
+            # semua worker lagi cooldown lama sekali, cegah rekursi tak berujung
+            return Status.ERROR
+
+        worker = self._pick_worker()
+        while worker is None:
+            await asyncio.sleep(1)
+            worker = self._pick_worker()
+
+        occupied = False  # ada yang resolve (dipakai orang), tapi belum tentu "taken" normal
+
+        async with worker.lock:
+            await asyncio.sleep(self.min_delay + random.uniform(0, 0.6))
+            try:
+                result = await worker.client(ResolveUsernameRequest(username))
+                entity = (result.chats or result.users or [None])[0]
+                if entity is not None and getattr(entity, "restricted", False):
+                    # Berhasil di-resolve TAPI ditandai restricted oleh Telegram
+                    # sendiri -> ini sinyal resmi banned/TOS violation.
+                    return Status.BANNED
+                occupied = True
+            except UsernameNotOccupiedError:
+                occupied = False
+            except UsernameInvalidError:
+                # Format lolos regex tapi Telegram bilang invalid -- kandidat
+                # lain untuk banned (jarang, tapi ini juga sinyal resmi).
+                return Status.BANNED
+            except FloodWaitError as e:
+                worker.cooldown_until = time.time() + e.seconds + 2
+                return await self.check(username, _depth + 1)
+            except Exception:
+                return Status.ERROR
+
+        # Fragment dicek DI LUAR lock worker supaya worker langsung bebas
+        # ngecek username lain. Dicek walau "occupied" karena username yang
+        # pernah dibeli lewat Fragment tetap "milik" Fragment walau lagi
+        # dipakai pemiliknya.
+        try:
+            is_listed = await check_fragment_listed(username)
+        except Exception:
+            # kalau fragment.com error/timeout, jangan gagalkan seluruh cek --
+            # anggap saja tidak listed
+            is_listed = False
+
+        if is_listed:
+            return Status.FRAGMENT
+        return Status.TAKEN if occupied else Status.AVAILABLE
+
+
+async def check_fragment_listed(username: str) -> bool:
     """
-    url = f"https://t.me/{username}"
-    try:
-        resp = await client.get(url, headers=HEADERS, timeout=15, follow_redirects=True)
-    except Exception as e:
-        return {"state": "unknown", "error": str(e), "raw": ""}
+    True kalau username ini beneran "milik" Fragment (lagi dilelang, dijual
+    harga tetap, atau sudah kejual/resale lewat Fragment).
 
-    html = resp.text
-    lower = html.lower()
+    False kalau:
+    - halaman tidak mengembalikan baris hasil untuk username ini sama sekali, ATAU
+    - baris hasilnya cuma menunjukkan status "Unavailable" generik.
 
-    if any(marker in lower for marker in BANNED_MARKERS):
-        return {"state": "banned", "raw": html[:800]}
-
-    soup = BeautifulSoup(html, "html.parser")
-    og_desc_tag = soup.find("meta", property="og:description")
-    og_description = (og_desc_tag.get("content") or "").strip() if og_desc_tag else ""
-    has_page_photo = soup.select_one(".tgme_page_photo") is not None
-    body_text = soup.get_text(" ", strip=True)
-
-    m = RIGHT_AWAY_RE.search(body_text)
-    mentioned_name = m.group(1).strip() if m else None
-    name_matches_username = (
-        mentioned_name is not None
-        and mentioned_name.lower().lstrip("@").rstrip(".").strip() == username.lower()
-    )
-
-    # Sinyal kuat akun ADA: nama di kalimat "right away" beda dari username,
-    # ATAU ada foto profil, ATAU ada og:description (bio).
-    exists_signal = (mentioned_name is not None and not name_matches_username) or has_page_photo or bool(og_description)
-
-    state = "taken" if exists_signal else "available"
-    return {
-        "state": state,
-        "raw": html[:800],
-        "mentioned_name": mentioned_name,
-        "has_page_photo": has_page_photo,
-        "og_description": og_description,
-    }
-
-
-async def check_fragment(client: httpx.AsyncClient, username: str) -> dict:
-    """
-    Return {'state': 'for_sale'|'owned_via_fragment'|'not_on_fragment'|'unknown', 'og_title': str, 'raw': str}
-
-    Berdasarkan pola og:title di fragment.com/username/<username>:
-      - "...auctions for usernames..." -> generic homepage -> tidak pernah lewat Fragment
-      - "Buy @username" (awalan)       -> lagi dijual harga tetap di Fragment
-      - mengandung "make an offer"     -> sudah dimiliki orang, hanya bisa nego swasta
+    PENTING: "Unavailable" di Fragment TERBUKTI muncul untuk username biasa
+    yang belum di-review sepenuhnya (banyak literally tampil begini, termasuk
+    yang sudah dipastikan available maupun yang banned) -- itu representasi
+    dari pembatasan rilis Fragment per rentang huruf, BUKAN sinyal soal
+    status username itu sendiri. Jadi status ini SENGAJA dianggap False di
+    sini, supaya keputusan available/banned tetap sepenuhnya ditentukan oleh
+    hasil resolveUsername (MTProto), bukan oleh Fragment.
     """
     url = f"https://fragment.com/username/{username}"
-    try:
+    async with _FRAGMENT_SEM:
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, headers=HEADERS, timeout=15, follow_redirects=True)
+        except Exception:
+            return False
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    target = f"@{username}".lower()
+    row = None
+    for tr in soup.select("tr[data-username]"):
+        if tr.get("data-username", "").lower() == target:
+            row = tr
+            break
+
+    if row is None:
+        return False
+
+    status_cell = row.select_one(".wide-last-col .tm-value")
+    status_text = status_cell.get_text(strip=True).lower() if status_cell else ""
+
+    if status_text in ("", "unavailable"):
+        return False
+
+    # Status lain yang ketemu di kolom ini kemungkinan besar: "for sale",
+    # "on auction", "sold", atau harga (mis. angka + simbol TON) -- semuanya
+    # berarti username ini beneran nyangkut di Fragment.
+    return True
+
+
+async def debug_fragment_row(username: str) -> str:
+    """Util kecil buat kalibrasi manual: kembalikan potongan HTML baris tabel
+    fragment.com untuk username ini (kalau ketemu), plus status_text yang
+    dibaca. Dipakai lewat command bot kalau suatu saat perlu debug lagi."""
+    url = f"https://fragment.com/username/{username}"
+    async with httpx.AsyncClient() as client:
         resp = await client.get(url, headers=HEADERS, timeout=15, follow_redirects=True)
-    except Exception as e:
-        return {"state": "unknown", "error": str(e), "og_title": "", "raw": ""}
 
-    og_title = _get_og_title(resp.text)
-    lower_title = og_title.lower()
+    soup = BeautifulSoup(resp.text, "html.parser")
+    target = f"@{username}".lower()
+    row = None
+    for tr in soup.select("tr[data-username]"):
+        if tr.get("data-username", "").lower() == target:
+            row = tr
+            break
 
-    if "auctions for usernames" in lower_title:
-        return {"state": "not_on_fragment", "og_title": og_title, "raw": resp.text[:800]}
-    if lower_title.startswith("buy @"):
-        return {"state": "for_sale", "og_title": og_title, "raw": resp.text[:800]}
-    if "make an offer" in lower_title:
-        return {"state": "owned_via_fragment", "og_title": og_title, "raw": resp.text[:800]}
+    if row is None:
+        return f"Tidak ketemu baris untuk @{username} di fragment.com."
 
-    return {"state": "unknown", "og_title": og_title, "raw": resp.text[:800]}
-
-
-async def debug_dump(client: httpx.AsyncClient, username: str) -> dict:
-    """Dump beberapa sinyal dari t.me + fragment.com untuk kalibrasi manual.
-    CATATAN: body_preview di sini DIPOTONG (500/700 karakter) hanya untuk
-    ditampilkan enak di chat. Deteksi asli (check_telegram/check_fragment)
-    tetap scan HTML PENUH, bukan potongan ini. Kalau butuh HTML lengkap
-    untuk cari marker baru, pakai fetch_raw_html() / command /rawfull.
-    """
-    tg_url = f"https://t.me/{username}"
-    fg_url = f"https://fragment.com/username/{username}"
-
-    result = {}
-
-    try:
-        resp = await client.get(tg_url, headers=HEADERS, timeout=15, follow_redirects=True)
-        html = resp.text
-        soup = BeautifulSoup(html, "html.parser")
-        title_tag = soup.find("title")
-        og_desc_tag = soup.find("meta", property="og:description")
-        og_image_tag = soup.find("meta", property="og:image")
-        has_page_photo = soup.select_one(".tgme_page_photo") is not None
-        has_action_button = soup.select_one(".tgme_action_button_new") is not None
-        body_text = soup.get_text(" ", strip=True)
-        result["tme"] = {
-            "status_code": resp.status_code,
-            "title": title_tag.get_text(strip=True) if title_tag else "(tidak ada)",
-            "og_description": (og_desc_tag.get("content") if og_desc_tag else "(tidak ada)"),
-            "og_image": (og_image_tag.get("content") if og_image_tag else "(tidak ada)"),
-            "has_page_photo": has_page_photo,
-            "has_action_button": has_action_button,
-            "body_preview": body_text[:500],
-        }
-    except Exception as e:
-        result["tme"] = {"error": str(e)}
-
-    try:
-        resp2 = await client.get(fg_url, headers=HEADERS, timeout=15, follow_redirects=True)
-        html2 = resp2.text
-        soup2 = BeautifulSoup(html2, "html.parser")
-        title_tag2 = soup2.find("title")
-        og_title_tag2 = soup2.find("meta", property="og:title")
-        og_desc_tag2 = soup2.find("meta", property="og:description")
-        body_text2 = soup2.get_text(" ", strip=True)
-        result["fragment"] = {
-            "status_code": resp2.status_code,
-            "final_url": str(resp2.url),
-            "title": title_tag2.get_text(strip=True) if title_tag2 else "(tidak ada)",
-            "og_title": (og_title_tag2.get("content") if og_title_tag2 else "(tidak ada)"),
-            "og_description": (og_desc_tag2.get("content") if og_desc_tag2 else "(tidak ada)"),
-            "body_preview": body_text2[:700],
-        }
-    except Exception as e:
-        result["fragment"] = {"error": str(e)}
-
-    return result
-
-
-async def fetch_raw_html(client: httpx.AsyncClient, username: str) -> dict:
-    """Ambil HTML MENTAH LENGKAP (tanpa dipotong sama sekali) dari t.me dan
-    fragment.com. Dipakai untuk kalibrasi manual: bandingkan HTML username
-    yang sudah pasti banned vs yang sudah pasti available, cari frasa
-    pembeda yang sebenarnya, lalu tambahkan ke BANNED_MARKERS di atas.
-
-    Return: {'tme_html': str, 'fragment_html': str}
-    (kalau gagal fetch salah satu, isinya string '[error: ...]')
-    """
-    result = {}
-    tg_url = f"https://t.me/{username}"
-    fg_url = f"https://fragment.com/username/{username}"
-
-    try:
-        resp = await client.get(tg_url, headers=HEADERS, timeout=15, follow_redirects=True)
-        result["tme_html"] = resp.text
-    except Exception as e:
-        result["tme_html"] = f"[error: {e}]"
-
-    try:
-        resp2 = await client.get(fg_url, headers=HEADERS, timeout=15, follow_redirects=True)
-        result["fragment_html"] = resp2.text
-    except Exception as e:
-        result["fragment_html"] = f"[error: {e}]"
-
-    return result
-
-
-async def check_username_full(client: httpx.AsyncClient, username: str) -> dict:
-    """
-    Gabungkan hasil t.me + fragment.com jadi satu status final. Fragment dicek
-    DULU karena kalau sudah kelihatan for_sale/owned di Fragment, itu paling
-    definitif -- t.me tidak perlu jadi penentu akhir untuk kasus itu.
-
-      - FRAGMENT       -> sedang dijual (fixed price) di Fragment
-      - TAKEN          -> sudah dipakai orang lain (baik lewat Fragment ataupun tidak)
-      - BANNED         -> akun/channel kena banned
-      - AVAILABLE      -> belum dipakai siapa-siapa & tidak nyangkut di Fragment
-      - UNKNOWN        -> gagal fetch / tidak bisa dipastikan
-    """
-    fg = await check_fragment(client, username)
-    tg = await check_telegram(client, username)
-
-    if fg["state"] == "for_sale":
-        final = "FRAGMENT"
-    elif fg["state"] == "owned_via_fragment":
-        final = "TAKEN"
-    elif tg["state"] == "banned":
-        final = "BANNED"
-    elif tg["state"] == "available" and fg["state"] in ("not_on_fragment", "unknown"):
-        final = "AVAILABLE"
-    elif tg["state"] == "taken":
-        final = "TAKEN"
-    elif tg["state"] == "available":
-        # t.me bilang available tapi fragment ambigu -> jangan buru-buru bilang available
-        final = "UNKNOWN"
-    else:
-        final = "UNKNOWN"
-
-    return {"final": final, "telegram": tg, "fragment": fg}
+    status_cell = row.select_one(".wide-last-col .tm-value")
+    status_text = status_cell.get_text(strip=True) if status_cell else "(tidak ada)"
+    return f"status_text = {status_text!r}\n\nHTML baris:\n{str(row)[:1500]}"
