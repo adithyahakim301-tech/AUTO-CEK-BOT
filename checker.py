@@ -13,10 +13,13 @@ halaman tersebut. Karena Telegram & Fragment bisa mengubah markup halaman
 sewaktu-waktu, ada kemungkinan deteksi meleset untuk kasus tertentu.
 
 Gunakan command /raw <username> di bot untuk melihat potongan HTML mentah
-dan sesuaikan kata kunci di fungsi di bawah kalau ternyata ada status yang
-salah baca. Sebelum dipakai produksi, coba dulu ke beberapa username yang
-statusnya sudah Anda ketahui pasti (satu yang jelas available, satu yang
-jelas taken, satu yang jelas banned) untuk kalibrasi.
+(preview terpotong) atau /rawfull <username> untuk mengambil HTML LENGKAP
+sebagai file .html -- ini penting kalau ada status yang salah baca, karena
+marker yang dicari mungkin ada di luar batas potongan preview.
+
+Sebelum dipakai produksi, coba dulu ke beberapa username yang statusnya
+sudah Anda ketahui pasti (satu yang jelas available, satu yang jelas taken,
+satu yang jelas banned) untuk kalibrasi.
 """
 
 import re
@@ -69,6 +72,16 @@ async def check_telegram(client: httpx.AsyncClient, username: str) -> dict:
     itu sendiri sebagai fallback kalau akun tidak ada, tapi memakai nama
     tampilan asli akun kalau akun ADA. Dikuatkan dengan cek foto profil &
     og:description (keduanya kosong/tidak ada kalau username belum dipakai).
+
+    CATATAN PENTING soal BANNED: sejauh ini terbukti username yang di-banned
+    BISA menghasilkan pola body yang SAMA PERSIS dengan username yang benar-
+    benar available (generic fallback "you can contact X right away" dengan
+    X == username itu sendiri, tanpa foto, tanpa og:description). Artinya
+    BANNED_MARKERS di atas belum tentu lengkap/akurat untuk semua kasus --
+    Telegram bisa memakai frasa lain untuk halaman banned yang belum masuk
+    daftar. Kalau ketemu username yang harusnya banned tapi kebaca available,
+    gunakan /rawfull untuk ambil HTML utuh, cari frasa pembeda yang sebenarnya,
+    lalu tambahkan ke BANNED_MARKERS.
     """
     url = f"https://t.me/{username}"
     try:
@@ -138,7 +151,12 @@ async def check_fragment(client: httpx.AsyncClient, username: str) -> dict:
 
 
 async def debug_dump(client: httpx.AsyncClient, username: str) -> dict:
-    """Dump beberapa sinyal dari t.me + fragment.com untuk kalibrasi manual."""
+    """Dump beberapa sinyal dari t.me + fragment.com untuk kalibrasi manual.
+    CATATAN: body_preview di sini DIPOTONG (500/700 karakter) hanya untuk
+    ditampilkan enak di chat. Deteksi asli (check_telegram/check_fragment)
+    tetap scan HTML PENUH, bukan potongan ini. Kalau butuh HTML lengkap
+    untuk cari marker baru, pakai fetch_raw_html() / command /rawfull.
+    """
     tg_url = f"https://t.me/{username}"
     fg_url = f"https://fragment.com/username/{username}"
 
@@ -184,6 +202,34 @@ async def debug_dump(client: httpx.AsyncClient, username: str) -> dict:
         }
     except Exception as e:
         result["fragment"] = {"error": str(e)}
+
+    return result
+
+
+async def fetch_raw_html(client: httpx.AsyncClient, username: str) -> dict:
+    """Ambil HTML MENTAH LENGKAP (tanpa dipotong sama sekali) dari t.me dan
+    fragment.com. Dipakai untuk kalibrasi manual: bandingkan HTML username
+    yang sudah pasti banned vs yang sudah pasti available, cari frasa
+    pembeda yang sebenarnya, lalu tambahkan ke BANNED_MARKERS di atas.
+
+    Return: {'tme_html': str, 'fragment_html': str}
+    (kalau gagal fetch salah satu, isinya string '[error: ...]')
+    """
+    result = {}
+    tg_url = f"https://t.me/{username}"
+    fg_url = f"https://fragment.com/username/{username}"
+
+    try:
+        resp = await client.get(tg_url, headers=HEADERS, timeout=15, follow_redirects=True)
+        result["tme_html"] = resp.text
+    except Exception as e:
+        result["tme_html"] = f"[error: {e}]"
+
+    try:
+        resp2 = await client.get(fg_url, headers=HEADERS, timeout=15, follow_redirects=True)
+        result["fragment_html"] = resp2.text
+    except Exception as e:
+        result["fragment_html"] = f"[error: {e}]"
 
     return result
 
