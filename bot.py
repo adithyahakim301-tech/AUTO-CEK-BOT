@@ -123,20 +123,28 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @_owner_only
 async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Buat kalibrasi: lihat potongan HTML mentah dari t.me dan fragment.com"""
+    """Buat kalibrasi: lihat beberapa sinyal mentah dari t.me + fragment.com"""
     if not context.args:
         await update.message.reply_text("Contoh: /raw username1")
         return
     username = context.args[0].lstrip("@")
     async with httpx.AsyncClient() as client:
-        tg = await checker.check_telegram(client, username)
+        dump = await checker.debug_dump(client, username)
         fg = await checker.check_fragment(client, username)
-    await update.message.reply_text(
-        f"[t.me] state={tg['state']}\nog:title = {tg.get('og_title', '(kosong)')!r}"
-    )
-    await update.message.reply_text(
-        f"[fragment] state={fg['state']}\nog:title = {fg.get('og_title', '(kosong)')!r}"
-    )
+
+    if "error" in dump:
+        await update.message.reply_text(f"[t.me] error: {dump['error']}")
+    else:
+        await update.message.reply_text(
+            "[t.me]\n"
+            f"status_code = {dump['status_code']}\n"
+            f"title = {dump['title']!r}\n"
+            f"og_description = {dump['og_description']!r}\n"
+            f"has_page_photo = {dump['has_page_photo']}\n"
+            f"has_action_button = {dump['has_action_button']}\n\n"
+            f"body_preview:\n{dump['body_preview']}"
+        )
+    await update.message.reply_text(f"[fragment] state={fg['state']}\nog:title = {fg.get('og_title', '(kosong)')!r}")
 
 
 async def background_checker(app: Application):
