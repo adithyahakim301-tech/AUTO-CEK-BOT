@@ -138,32 +138,54 @@ async def check_fragment(client: httpx.AsyncClient, username: str) -> dict:
 
 
 async def debug_dump(client: httpx.AsyncClient, username: str) -> dict:
-    """Dump beberapa sinyal dari t.me untuk kalibrasi manual (bukan dipakai di logika utama)."""
-    url = f"https://t.me/{username}"
+    """Dump beberapa sinyal dari t.me + fragment.com untuk kalibrasi manual."""
+    tg_url = f"https://t.me/{username}"
+    fg_url = f"https://fragment.com/username/{username}"
+
+    result = {}
+
     try:
-        resp = await client.get(url, headers=HEADERS, timeout=15, follow_redirects=True)
+        resp = await client.get(tg_url, headers=HEADERS, timeout=15, follow_redirects=True)
+        html = resp.text
+        soup = BeautifulSoup(html, "html.parser")
+        title_tag = soup.find("title")
+        og_desc_tag = soup.find("meta", property="og:description")
+        og_image_tag = soup.find("meta", property="og:image")
+        has_page_photo = soup.select_one(".tgme_page_photo") is not None
+        has_action_button = soup.select_one(".tgme_action_button_new") is not None
+        body_text = soup.get_text(" ", strip=True)
+        result["tme"] = {
+            "status_code": resp.status_code,
+            "title": title_tag.get_text(strip=True) if title_tag else "(tidak ada)",
+            "og_description": (og_desc_tag.get("content") if og_desc_tag else "(tidak ada)"),
+            "og_image": (og_image_tag.get("content") if og_image_tag else "(tidak ada)"),
+            "has_page_photo": has_page_photo,
+            "has_action_button": has_action_button,
+            "body_preview": body_text[:500],
+        }
     except Exception as e:
-        return {"error": str(e)}
+        result["tme"] = {"error": str(e)}
 
-    html = resp.text
-    soup = BeautifulSoup(html, "html.parser")
+    try:
+        resp2 = await client.get(fg_url, headers=HEADERS, timeout=15, follow_redirects=True)
+        html2 = resp2.text
+        soup2 = BeautifulSoup(html2, "html.parser")
+        title_tag2 = soup2.find("title")
+        og_title_tag2 = soup2.find("meta", property="og:title")
+        og_desc_tag2 = soup2.find("meta", property="og:description")
+        body_text2 = soup2.get_text(" ", strip=True)
+        result["fragment"] = {
+            "status_code": resp2.status_code,
+            "final_url": str(resp2.url),
+            "title": title_tag2.get_text(strip=True) if title_tag2 else "(tidak ada)",
+            "og_title": (og_title_tag2.get("content") if og_title_tag2 else "(tidak ada)"),
+            "og_description": (og_desc_tag2.get("content") if og_desc_tag2 else "(tidak ada)"),
+            "body_preview": body_text2[:700],
+        }
+    except Exception as e:
+        result["fragment"] = {"error": str(e)}
 
-    title_tag = soup.find("title")
-    og_desc_tag = soup.find("meta", property="og:description")
-    og_image_tag = soup.find("meta", property="og:image")
-    has_page_photo = soup.select_one(".tgme_page_photo") is not None
-    has_action_button = soup.select_one(".tgme_action_button_new") is not None
-    body_text = soup.get_text(" ", strip=True)
-
-    return {
-        "status_code": resp.status_code,
-        "title": title_tag.get_text(strip=True) if title_tag else "(tidak ada)",
-        "og_description": (og_desc_tag.get("content") if og_desc_tag else "(tidak ada)"),
-        "og_image": (og_image_tag.get("content") if og_image_tag else "(tidak ada)"),
-        "has_page_photo": has_page_photo,
-        "has_action_button": has_action_button,
-        "body_preview": body_text[:500],
-    }
+    return result
 
 
 async def check_username_full(client: httpx.AsyncClient, username: str) -> dict:
