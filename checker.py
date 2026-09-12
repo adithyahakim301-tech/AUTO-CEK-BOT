@@ -239,14 +239,24 @@ async def debug_fragment_row(username: str) -> str:
     title = title_tag.get_text(strip=True) if title_tag else "(tidak ada)"
     final_url = str(resp.url)
 
+    og_title_tag = soup.find("meta", property="og:title")
+    og_title = (og_title_tag.get("content") or "").strip() if og_title_tag else "(tidak ada)"
+    og_desc_tag = soup.find("meta", property="og:description")
+    og_desc = (og_desc_tag.get("content") or "").strip() if og_desc_tag else "(tidak ada)"
+
+    body_text = soup.get_text(" ", strip=True)
+
     is_listed = "?query=" not in final_url and "/query=" not in final_url
 
     diag = (
         f"status_code = {resp.status_code}\n"
         f"final_url = {final_url}\n"
         f"title halaman = {title!r}\n"
+        f"og_title = {og_title!r}\n"
+        f"og_description = {og_desc!r}\n"
         f"panjang HTML = {len(html)} karakter\n"
-        f"kesimpulan is_listed (logika baru) = {is_listed}\n"
+        f"kesimpulan is_listed (logika redirect saja) = {is_listed}\n\n"
+        f"body_preview:\n{body_text[:600]}\n"
     )
 
     if "cloudflare" in html.lower() or "captcha" in html.lower() or "checking your browser" in html.lower():
