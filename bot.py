@@ -130,6 +130,7 @@ async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = context.args[0].lstrip("@")
     async with httpx.AsyncClient() as client:
         dump = await checker.debug_dump(client, username)
+        tg = await checker.check_telegram(client, username)
         fg = await checker.check_fragment(client, username)
 
     if "error" in dump:
@@ -142,7 +143,10 @@ async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"og_description = {dump['og_description']!r}\n"
             f"has_page_photo = {dump['has_page_photo']}\n"
             f"has_action_button = {dump['has_action_button']}\n\n"
-            f"body_preview:\n{dump['body_preview']}"
+            f"body_preview:\n{dump['body_preview']}\n\n"
+            f"--- KESIMPULAN ---\n"
+            f"state = {tg['state']}\n"
+            f"nama di kalimat 'right away' = {tg.get('mentioned_name')!r}"
         )
     await update.message.reply_text(f"[fragment] state={fg['state']}\nog:title = {fg.get('og_title', '(kosong)')!r}")
 
