@@ -6,33 +6,34 @@ Fitur:
 - /remove username       -> hapus dari watchlist
 - /list                  -> lihat watchlist + status terakhir
 - /check username        -> cek langsung satu username
-- /raw username          -> lihat potongan HTML mentah (buat kalibrasi deteksi)
-- /rawfull username      -> kirim HTML MENTAH LENGKAP (t.me + fragment) sebagai
-                             file .html, dipakai kalau /raw kurang untuk cari
-                             marker banned yang sebenarnya (karena preview di
-                             /raw dipotong 500/700 karakter)
 - Background loop        -> jalan terus, muter round-robin ke semua username
                              di watchlist dengan jeda antar-cek supaya aman
                              dari rate limit, dan kirim notifikasi ke Anda
                              kalau ada status yang BERUBAH.
 
-Tidak pakai akun Telegram pribadi sama sekali untuk pengecekan -- hanya
-scraping halaman publik t.me dan fragment.com. Bot Telegram (BOT_TOKEN)
-cuma dipakai untuk kirim/terima pesan command dengan Anda.
+Pengecekan status (available/taken/banned/fragment) sekarang pakai MTProto
+(Telethon) lewat checker.UsernamePool -- BUKAN scraping t.me lagi, karena
+t.me terbukti tidak bisa membedakan username available vs banned (halaman
+publiknya identik untuk keduanya). Fragment.com tetap dicek via scraping,
+tapi cuma untuk deteksi listing/lelang, bukan untuk nentuin available/banned.
+
+BOT_TOKEN dipakai dua jalur sekaligus (aman, beda transport):
+- python-telegram-bot (Bot API)  -> kirim/terima pesan command dengan Anda
+- Telethon (MTProto)             -> panggil contacts.resolveUsername buat cek
 """
 
 import asyncio
-import io
 import logging
 import os
 from datetime import datetime, timezone
 
-import httpx
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telethon import TelegramClient
 
 import checker
 import storage
+from checker import Status, UsernamePool, Worker
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -42,15 +43,31 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_CHAT_ID = int(os.environ["OWNER_CHAT_ID"])
-CHECK_DELAY_SECONDS = float(os.getenv("CHECK_DELAY_SECONDS", "3"))
+API_ID = int(os.environ["API_ID"])       # dari my.telegram.org
+API_HASH = os.environ["API_HASH"]        # dari my.telegram.org
+CHECK_DELAY_SECONDS = float(os.getenv("CHECK_DELAY_SECONDS", "1"))
 
 STATE_LABEL = {
     "AVAILABLE": "🟢 AVAILABLE (bisa di-keep)",
     "TAKEN": "🟡 TAKEN (sedang dipakai orang)",
     "FRAGMENT": "🔷 FRAGMENT (di-auction/dijual di Fragment)",
     "BANNED": "🔴 BANNED",
-    "UNKNOWN": "⚪ UNKNOWN (perlu cek manual, hasil ambigu)",
+    "INVALID": "⚫ INVALID (format username salah)",
+    "ERROR": "⚪ ERROR (gagal dicek, coba lagi nanti)",
 }
+
+# Status dari checker.Status (huruf kecil) -> key yang dipakai di STATE_LABEL
+# dan ACTION_LINE di bawah (huruf besar).
+STATUS_TO_FINAL = {
+    Status.AVAILABLE: "AVAILABLE",
+    Status.FRAGMENT: "FRAGMENT",
+    Status.TAKEN: "TAKEN",
+    Status.BANNED: "BANNED",
+    Status.INVALID: "INVALID",
+    Status.ERROR: "ERROR",
+}
+
+pool: UsernamePool | None = None
 
 
 def _owner_only(func):
@@ -68,9 +85,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/add user1 user2 ... - tambah username\n"
         "/remove username - hapus username\n"
         "/list - lihat watchlist\n"
-        "/check username - cek langsung\n"
-        "/raw username - lihat potongan HTML mentah (debug)\n"
-        "/rawfull username - kirim HTML lengkap sebagai file (debug lanjutan)"
+        "/check username - cek langsung"
     )
 
 
@@ -107,7 +122,6 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = STATE_LABEL.get(state, state)
         checked = info.get("last_checked") or "-"
         lines.append(f"@{uname} -> {label} (terakhir: {checked})")
-    # Telegram punya limit panjang pesan, potong per 50 baris kalau kepanjangan
     text = "\n".join(lines)
     for i in range(0, len(text), 3500):
         await update.message.reply_text(text[i:i + 3500])
@@ -120,82 +134,11 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     username = context.args[0].lstrip("@")
     await update.message.reply_text(f"Mengecek @{username} ...")
-    async with httpx.AsyncClient() as client:
-        result = await checker.check_username_full(client, username)
+    raw_status = await pool.check(username)
+    final = STATUS_TO_FINAL.get(raw_status, "ERROR")
     await update.message.reply_text(
-        f"@{username} -> {STATE_LABEL.get(result['final'], result['final'])}"
+        f"@{username} -> {STATE_LABEL.get(final, final)}"
     )
-
-
-@_owner_only
-async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Buat kalibrasi: lihat data mentah dari t.me + fragment.com (dipotong
-    500/700 karakter biar muat di satu pesan chat). Kalau ini kurang buat
-    nemuin marker yang dicari, pakai /rawfull untuk HTML lengkap."""
-    if not context.args:
-        await update.message.reply_text("Contoh: /raw username1")
-        return
-    username = context.args[0].lstrip("@")
-    async with httpx.AsyncClient() as client:
-        dump = await checker.debug_dump(client, username)
-        tg = await checker.check_telegram(client, username)
-        fg = await checker.check_fragment(client, username)
-
-    tme = dump.get("tme", {})
-    if "error" in tme:
-        await update.message.reply_text(f"[t.me] error: {tme['error']}")
-    else:
-        await update.message.reply_text(
-            "[t.me]\n"
-            f"status_code = {tme['status_code']}\n"
-            f"title = {tme['title']!r}\n"
-            f"og_description = {tme['og_description']!r}\n"
-            f"has_page_photo = {tme['has_page_photo']}\n"
-            f"has_action_button = {tme['has_action_button']}\n\n"
-            f"body_preview:\n{tme['body_preview']}\n\n"
-            f"--- KESIMPULAN t.me ---\n"
-            f"state = {tg['state']}\n"
-            f"nama di kalimat 'right away' = {tg.get('mentioned_name')!r}"
-        )
-
-    frag = dump.get("fragment", {})
-    if "error" in frag:
-        await update.message.reply_text(f"[fragment full page] error: {frag['error']}")
-    else:
-        await update.message.reply_text(
-            "[fragment.com full page]\n"
-            f"status_code = {frag['status_code']}\n"
-            f"final_url = {frag['final_url']}\n"
-            f"title = {frag['title']!r}\n"
-            f"og_title = {frag['og_title']!r}\n"
-            f"og_description = {frag['og_description']!r}\n\n"
-            f"body_preview:\n{frag['body_preview']}\n\n"
-            f"--- KESIMPULAN fragment ---\n"
-            f"state = {fg['state']}"
-        )
-
-
-@_owner_only
-async def cmd_rawfull(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kirim HTML mentah LENGKAP (t.me + fragment) sebagai file .html,
-    tanpa dipotong sama sekali. Dipakai kalau /raw kurang untuk mencari
-    marker banned/status yang sebenarnya (misal username yang harusnya
-    banned tapi kebaca available/unknown oleh checker)."""
-    if not context.args:
-        await update.message.reply_text("Contoh: /rawfull username1")
-        return
-    username = context.args[0].lstrip("@")
-    await update.message.reply_text(f"Mengambil HTML lengkap untuk @{username} ...")
-    async with httpx.AsyncClient() as client:
-        dump = await checker.fetch_raw_html(client, username)
-
-    tme_bytes = io.BytesIO(dump["tme_html"].encode("utf-8"))
-    tme_bytes.name = f"tme_{username}.html"
-    await update.message.reply_document(tme_bytes)
-
-    fg_bytes = io.BytesIO(dump["fragment_html"].encode("utf-8"))
-    fg_bytes.name = f"fragment_{username}.html"
-    await update.message.reply_document(fg_bytes)
 
 
 ACTIONABLE_STATES = {"AVAILABLE", "FRAGMENT", "BANNED"}
@@ -208,8 +151,10 @@ ACTION_LINE = {
 
 
 async def background_checker(app: Application):
-    """Loop tanpa henti: muter round-robin ke semua username di watchlist,
-    dengan jeda CHECK_DELAY_SECONDS antar-cek supaya tidak kena rate limit.
+    """Loop tanpa henti: muter round-robin ke semua username di watchlist.
+    checker.UsernamePool sudah punya jeda + jitter internal sendiri per
+    request MTProto, jadi CHECK_DELAY_SECONDS di sini cuma jeda TAMBAHAN
+    antar-username (boleh dikecilkan/dihilangkan kalau mau lebih cepat).
 
     Setelah SATU PUTARAN PENUH selesai, kirim SATU pesan ringkasan berisi
     semua username yang statusnya AVAILABLE, FRAGMENT, atau BANNED -- tapi
@@ -217,46 +162,53 @@ async def background_checker(app: Application):
     dicek dan langsung actionable). Kalau statusnya sudah pernah dikabarkan
     dan belum berubah, tidak diulang lagi supaya tidak spam."""
     await app.bot.send_message(OWNER_CHAT_ID, "✅ Background checker mulai jalan.")
-    async with httpx.AsyncClient() as client:
-        while True:
-            wl = storage.get_watchlist()
-            if not wl:
-                await asyncio.sleep(10)
-                continue
+    while True:
+        wl = storage.get_watchlist()
+        if not wl:
+            await asyncio.sleep(10)
+            continue
 
-            to_report = []  # list of (username, state) yang perlu dikabarkan putaran ini
+        to_report = []  # list of (username, state) yang perlu dikabarkan putaran ini
 
-            for username in list(wl.keys()):
-                try:
-                    result = await checker.check_username_full(client, username)
-                    new_state = result["final"]
-                    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        for username in list(wl.keys()):
+            try:
+                raw_status = await pool.check(username)
+                new_state = STATUS_TO_FINAL.get(raw_status, "ERROR")
+                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-                    storage.update_state(username, new_state, now_str)
+                storage.update_state(username, new_state, now_str)
 
-                    last_notified = wl.get(username, {}).get("last_notified")
+                last_notified = wl.get(username, {}).get("last_notified")
 
-                    if new_state in ACTIONABLE_STATES:
-                        if last_notified != new_state:
-                            to_report.append((username, new_state))
-                            storage.update_notified(username, new_state)
-                    else:
-                        # status sudah tidak actionable lagi -> reset, supaya kalau
-                        # nanti balik lagi jadi available/fragment/banned, dikabarkan ulang
-                        if last_notified is not None:
-                            storage.update_notified(username, None)
+                if new_state in ACTIONABLE_STATES:
+                    if last_notified != new_state:
+                        to_report.append((username, new_state))
+                        storage.update_notified(username, new_state)
+                else:
+                    # status sudah tidak actionable lagi -> reset, supaya kalau
+                    # nanti balik lagi jadi available/fragment/banned, dikabarkan ulang
+                    if last_notified is not None:
+                        storage.update_notified(username, None)
 
-                except Exception as e:
-                    logger.exception(f"Gagal cek {username}: {e}")
+            except Exception as e:
+                logger.exception(f"Gagal cek {username}: {e}")
 
-                await asyncio.sleep(CHECK_DELAY_SECONDS)
+            await asyncio.sleep(CHECK_DELAY_SECONDS)
 
-            if to_report:
-                lines = [ACTION_LINE[state](u) for u, state in to_report]
-                await app.bot.send_message(OWNER_CHAT_ID, "\n".join(lines))
+        if to_report:
+            lines = [ACTION_LINE[state](u) for u, state in to_report]
+            await app.bot.send_message(OWNER_CHAT_ID, "\n".join(lines))
 
 
 async def _post_init(app: Application):
+    global pool
+    os.makedirs("sessions", exist_ok=True)
+    tele_client = TelegramClient("sessions/checker_worker", API_ID, API_HASH)
+    await tele_client.start(bot_token=BOT_TOKEN)
+    worker = Worker(client=tele_client, name="worker_0")
+    pool = UsernamePool([worker], min_delay=1.3)
+    logger.info("UsernamePool siap (1 worker).")
+
     # Jalankan background loop sebagai task terpisah, tidak blocking bot command
     asyncio.create_task(background_checker(app))
 
@@ -269,8 +221,6 @@ def main():
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("check", cmd_check))
-    app.add_handler(CommandHandler("raw", cmd_raw))
-    app.add_handler(CommandHandler("rawfull", cmd_rawfull))
 
     logger.info("Bot starting...")
     app.run_polling()
