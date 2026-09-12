@@ -184,25 +184,25 @@ class UsernamePool:
 
 async def check_fragment_listed(username: str) -> bool:
     """
-    True kalau username ini beneran "milik" Fragment (lagi dilelang, dijual
-    harga tetap, atau sudah kejual/resale lewat Fragment).
+    True HANYA kalau username ini beneran dijual/dilelang/sudah kejual lewat
+    Fragment (butuh transaksi TON di Fragment buat dapetinnya).
 
-    SINYAL YANG DIPAKAI (terbukti dari perbandingan nyata):
-    - Kalau fragment.com PUNYA halaman detail khusus untuk username ini,
-      request ke /username/<username> TETAP di URL itu (tidak di-redirect).
-      Ini kejadian nyata pada @lsanghyeon (listing aktif) -> final_url tetap
-      "https://fragment.com/username/lsanghyeon", dengan og:title
-      "Buy @lsanghyeon" / "lsanghyeon – Fragment".
-    - Kalau fragment.com TIDAK punya listing untuk username ini, request
-      di-redirect ke halaman pencarian "https://fragment.com/?query=<username>".
-      Ini kejadian nyata pada @weonho dan @fikayr (keduanya bukan listing,
-      salah satunya malah banned) -- keduanya sama-sama di-redirect ke
-      halaman pencarian, meski tabel hasilnya sempat menampilkan status
-      "Unavailable" generik (yang TERBUKTI tidak berarti apa-apa soal
-      username itu sendiri, lihat catatan di check_username_full).
-
-    Jadi: redirect ke ?query= -> bukan listing. Tetap di /username/<nama>
-    -> listing beneran.
+    SINYAL YANG DIPAKAI (terbukti dari 3 kasus nyata):
+    1. Request ke /username/<username> di-redirect ke "?query=..." (halaman
+       pencarian generik) -> Fragment sama sekali tidak melacak username ini
+       -> BUKAN listing. Kejadian nyata: @weonho, @fikayr.
+    2. Request TETAP di /username/<username> (halaman detail sendiri) DAN
+       og:title diawali "Buy @" -> ini beneran item Fragment (baik lagi
+       dijual maupun sudah kejual dengan riwayat transaksi TON) -> LISTING.
+       Kejadian nyata: @lsanghyeon (og:title "Buy @lsanghyeon", body-nya
+       malah nunjukin "Sold" + riwayat kepemilikan -- tetap dihitung listing
+       karena statusnya "milik" Fragment, cuma udah pernah/lagi ditransaksikan).
+    3. Request TETAP di /username/<username> TAPI og:title-nya
+       "Make an offer for @username" -> ini FITUR GENERIK Fragment yang
+       muncul untuk SEMUA username taken biasa (nawarin pengunjung buat
+       kirim tawaran ke pemiliknya) -- BUKAN berarti username-nya beneran
+       dijual di Fragment. Kejadian nyata: @dintak, @chanyeold (taken biasa,
+       bukan listing).
     """
     url = f"https://fragment.com/username/{username}"
     async with _FRAGMENT_SEM:
@@ -214,14 +214,23 @@ async def check_fragment_listed(username: str) -> bool:
 
     final_url = str(resp.url)
 
-    # Di-redirect ke halaman pencarian -> bukan listing.
+    # Kasus 1: di-redirect ke halaman pencarian -> Fragment tidak melacak
+    # username ini sama sekali -> bukan listing.
     if "?query=" in final_url or "/query=" in final_url:
         return False
 
-    # Tetap di halaman detail /username/<nama> -> Fragment mengenali ini
-    # sebagai item tersendiri (listing). og:title cuma dipakai buat log/
-    # kepastian tambahan, bukan syarat mutlak.
-    return True
+    # Kasus 2 & 3: baca og:title dari halaman detail.
+    soup = BeautifulSoup(resp.text, "html.parser")
+    og_title_tag = soup.find("meta", property="og:title")
+    og_title = (og_title_tag.get("content") or "").strip().lower() if og_title_tag else ""
+
+    if og_title.startswith("buy @"):
+        return True  # beneran item Fragment (dijual/sudah kejual)
+
+    # "make an offer for @username" atau pola lain di halaman detail yang
+    # bukan "buy @" -> cuma fitur generik utk username taken biasa, bukan
+    # listing beneran.
+    return False
 
 
 async def debug_fragment_row(username: str) -> str:
@@ -246,7 +255,7 @@ async def debug_fragment_row(username: str) -> str:
 
     body_text = soup.get_text(" ", strip=True)
 
-    is_listed = "?query=" not in final_url and "/query=" not in final_url
+    is_listed = ("?query=" not in final_url and "/query=" not in final_url) and og_title.lower().startswith("buy @")
 
     diag = (
         f"status_code = {resp.status_code}\n"
@@ -255,7 +264,7 @@ async def debug_fragment_row(username: str) -> str:
         f"og_title = {og_title!r}\n"
         f"og_description = {og_desc!r}\n"
         f"panjang HTML = {len(html)} karakter\n"
-        f"kesimpulan is_listed (logika redirect saja) = {is_listed}\n\n"
+        f"kesimpulan is_listed (final) = {is_listed}\n\n"
         f"body_preview:\n{body_text[:600]}\n"
     )
 
