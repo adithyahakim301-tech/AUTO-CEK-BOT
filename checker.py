@@ -19,6 +19,8 @@ statusnya sudah Anda ketahui pasti (satu yang jelas available, satu yang
 jelas taken, satu yang jelas banned) untuk kalibrasi.
 """
 
+import re
+
 import httpx
 from bs4 import BeautifulSoup
 
@@ -30,8 +32,6 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Terbukti reliable dari pengalaman lapangan: baca meta tag og:title,
-# bukan class HTML yang gampang berubah / gagal match.
 BANNED_MARKERS = [
     "this account has been banned",
     "this channel can't be displayed",
@@ -41,8 +41,16 @@ BANNED_MARKERS = [
     "spread violent content",
 ]
 
-# og:title generik yang muncul kalau t.me/<username> TIDAK menemukan apapun
-GENERIC_TG_TITLES = {"telegram messenger", "telegram", ""}
+# Pola: "If you have Telegram, you can [contact|view and join|launch|join] X right away."
+# Kalau X == username itu sendiri -> generic fallback -> username TIDAK terdaftar.
+# Kalau X == nama lain (nama tampilan asli akun) -> username SUDAH dipakai.
+# PENTING: harus dijangkar ke "If you have Telegram, you can..." -- kalau cuma
+# cari kata "contact" saja, dia kepancing sama judul halaman "Telegram: Contact
+# @username" yang SELALU ada di awal body, sebelum kalimat yang sebenarnya.
+RIGHT_AWAY_RE = re.compile(
+    r"if you have telegram\s*,?\s*you can\s+(?:contact|view and join|launch|join)\s+(.+?)\s+right away",
+    re.IGNORECASE,
+)
 
 
 def _get_og_title(html: str) -> str:
@@ -52,25 +60,53 @@ def _get_og_title(html: str) -> str:
 
 
 async def check_telegram(client: httpx.AsyncClient, username: str) -> dict:
-    """Return {'state': 'available'|'taken'|'banned'|'unknown', 'og_title': str, 'raw': str}"""
+    """Return {'state': 'available'|'taken'|'banned'|'unknown', 'raw': str}
+
+    Catatan kalibrasi (dari data nyata): og:title SELALU berformat generik
+    "Telegram: Contact @username" baik untuk username yang ada maupun yang
+    tidak -- jadi og:title TIDAK dipakai untuk penentuan status. Sinyal asli
+    ada di body: kalimat "...you can contact X right away" memakai username
+    itu sendiri sebagai fallback kalau akun tidak ada, tapi memakai nama
+    tampilan asli akun kalau akun ADA. Dikuatkan dengan cek foto profil &
+    og:description (keduanya kosong/tidak ada kalau username belum dipakai).
+    """
     url = f"https://t.me/{username}"
     try:
         resp = await client.get(url, headers=HEADERS, timeout=15, follow_redirects=True)
     except Exception as e:
-        return {"state": "unknown", "error": str(e), "og_title": "", "raw": ""}
+        return {"state": "unknown", "error": str(e), "raw": ""}
 
     html = resp.text
     lower = html.lower()
-    og_title = _get_og_title(html)
 
     if any(marker in lower for marker in BANNED_MARKERS):
-        return {"state": "banned", "og_title": og_title, "raw": html[:800]}
+        return {"state": "banned", "raw": html[:800]}
 
-    if og_title.lower() in GENERIC_TG_TITLES:
-        # tidak ada preview user/channel/bot -> username belum dipakai siapapun
-        return {"state": "available", "og_title": og_title, "raw": html[:800]}
+    soup = BeautifulSoup(html, "html.parser")
+    og_desc_tag = soup.find("meta", property="og:description")
+    og_description = (og_desc_tag.get("content") or "").strip() if og_desc_tag else ""
+    has_page_photo = soup.select_one(".tgme_page_photo") is not None
+    body_text = soup.get_text(" ", strip=True)
 
-    return {"state": "taken", "og_title": og_title, "raw": html[:800]}
+    m = RIGHT_AWAY_RE.search(body_text)
+    mentioned_name = m.group(1).strip() if m else None
+    name_matches_username = (
+        mentioned_name is not None
+        and mentioned_name.lower().lstrip("@").rstrip(".").strip() == username.lower()
+    )
+
+    # Sinyal kuat akun ADA: nama di kalimat "right away" beda dari username,
+    # ATAU ada foto profil, ATAU ada og:description (bio).
+    exists_signal = (mentioned_name is not None and not name_matches_username) or has_page_photo or bool(og_description)
+
+    state = "taken" if exists_signal else "available"
+    return {
+        "state": state,
+        "raw": html[:800],
+        "mentioned_name": mentioned_name,
+        "has_page_photo": has_page_photo,
+        "og_description": og_description,
+    }
 
 
 async def check_fragment(client: httpx.AsyncClient, username: str) -> dict:
@@ -128,6 +164,9 @@ async def debug_dump(client: httpx.AsyncClient, username: str) -> dict:
         "has_action_button": has_action_button,
         "body_preview": body_text[:500],
     }
+
+
+async def check_username_full(client: httpx.AsyncClient, username: str) -> dict:
     """
     Gabungkan hasil t.me + fragment.com jadi satu status final. Fragment dicek
     DULU karena kalau sudah kelihatan for_sale/owned di Fragment, itu paling
