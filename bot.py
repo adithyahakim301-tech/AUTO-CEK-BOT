@@ -45,6 +45,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_CHAT_ID = int(os.environ["OWNER_CHAT_ID"])
 API_ID = int(os.environ["API_ID"])       # dari my.telegram.org
 API_HASH = os.environ["API_HASH"]        # dari my.telegram.org
+RELAY_CHAT_ID = os.getenv("RELAY_CHAT_ID")  # opsional: id grup relay ke bot autokeep
 CHECK_DELAY_SECONDS = float(os.getenv("CHECK_DELAY_SECONDS", "1"))
 
 STATE_LABEL = {
@@ -208,7 +209,13 @@ async def background_checker(app: Application):
 
         if to_report:
             lines = [ACTION_LINE[state](u) for u, state in to_report]
-            await app.bot.send_message(OWNER_CHAT_ID, "\n".join(lines))
+            text = "\n".join(lines)
+            await app.bot.send_message(OWNER_CHAT_ID, text)
+            if RELAY_CHAT_ID:
+                try:
+                    await app.bot.send_message(int(RELAY_CHAT_ID), text)
+                except Exception as e:
+                    logger.exception(f"Gagal kirim ke grup relay: {e}")
 
 
 async def _post_init(app: Application):
