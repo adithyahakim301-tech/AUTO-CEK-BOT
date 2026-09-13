@@ -25,6 +25,7 @@ BOT_TOKEN dipakai dua jalur sekaligus (aman, beda transport):
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 from telegram import BotCommand, Update
@@ -95,9 +96,19 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Contoh: /add username1 username2")
         return
-    added = storage.add_usernames(context.args)
+    # Gabung ulang semua argumen, terus ambil username-nya pakai regex --
+    # jadi gak peduli dipisah spasi, koma, newline, atau campuran ("@user1,
+    # @user2, @user3" tetap kebaca bersih tanpa komanya ikut nempel).
+    raw = " ".join(context.args)
+    usernames = re.findall(r"[a-zA-Z][a-zA-Z0-9_]{4,31}", raw)
+    if not usernames:
+        await update.message.reply_text("Tidak ada username valid yang ketemu di pesan itu.")
+        return
+    added = storage.add_usernames(usernames)
     if added:
-        await update.message.reply_text("Ditambahkan: " + ", ".join(added))
+        text = f"Ditambahkan ({len(added)}): " + ", ".join(added)
+        for i in range(0, len(text), 3500):
+            await update.message.reply_text(text[i:i + 3500])
     else:
         await update.message.reply_text("Tidak ada yang baru ditambahkan (mungkin sudah ada).")
 
